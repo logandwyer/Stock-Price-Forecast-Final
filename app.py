@@ -64,7 +64,7 @@ except Exception as e:
     import textwrap
     st.error("`yfinance` is not available. If you're on Streamlit Cloud, ensure your **requirements.txt** is in the repo root and includes `yfinance==0.2.43`. "
              "This app also attempts an auto-install at startup; if that failed, try redeploying or pinning a slightly different version.")
-    st.code(textwrap.dedent(\"\"\"
+    st.code(textwrap.dedent("""
     requirements.txt
     -----------------
     streamlit==1.38.0
@@ -74,7 +74,7 @@ except Exception as e:
     plotly==5.23.0
     scipy==1.11.4
     scikit-learn==1.5.1
-    \"\"\"))
+    """))
     raise e
 
 st.set_page_config(page_title="Macro-Informed Stock Forecaster", page_icon="📈", layout="wide")
