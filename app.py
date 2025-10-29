@@ -160,10 +160,9 @@ def fetch_all(ticker: str, lookback_years: int) -> pd.DataFrame:
         else:
             failed = list(set(failed + [ticker]))
 
-    # Surface failed symbols to the UI once (non-blocking)
-    if failed:
-        st.warning("Some data sources were unavailable and were skipped: " + ", ".join(sorted(set(failed))) +
-                   ". The forecast will proceed with what’s available.")
+    # Quietly proceed even if some series are missing
+    # (Intentionally no UI warning by request)
+    _ = failed  # keep for potential logging later
 
     return data
 
@@ -328,6 +327,102 @@ else:
 S0 = float(close.iloc[-1])
 gbm_df = gbm_expectations(S0, base_mu, base_sig, HORIZONS)
 
+def build_summary(
+    ticker: str,
+    S0: float,
+    mean_path: np.ndarray,
+    horizons: dict,
+    base_mu: float,
+    base_sig: float,
+    regimes_series: pd.Series | None,
+    ml_daily_drift: float | None,
+    regime_on: bool,
+    garch_on: bool,
+    shock_prob: float,
+    shock_sev: float,
+) -> str:
+    # Expected prices/returns from the simulated mean path
+    exp_prices = {name: float(mean_path[d]) for name, d in horizons.items()}
+    exp_rets = {k: (v / S0 - 1.0) for k, v in exp_prices.items()}
+
+    ann_drift = float(base_mu * 252.0)
+    ann_vol = float(base_sig * np.sqrt(252.0))
+
+    # Regime & ML annotations
+    last_regime = None
+    if regime_on and regimes_series is not None and not regimes_series.dropna().empty:
+        last_regime = str(regimes_series.dropna().iloc[-1])
+    ml_note = None
+    if ml_daily_drift is not None:
+        ml_note = float(ml_daily_drift * 252.0)  # annualized contribution if active
+
+    # A simple risk-adjusted score using 1y horizon
+    one_year_ret = exp_rets.get("1 year (~252d)", np.nan)
+    score = np.nan
+    if np.isfinite(one_year_ret) and ann_vol > 1e-8:
+        score = one_year_ret / ann_vol  # Sharpe-like (no rf)
+
+    # Penalize score if heavy shock settings
+    shock_penalty = min(0.3, shock_prob * shock_sev)  # light penalty cap
+    if np.isfinite(score):
+        score -= shock_penalty
+
+    # Verdict
+    verdict = "Mixed"
+    reason_bits = []
+    if np.isfinite(one_year_ret):
+        if one_year_ret > 0.05 and (np.isfinite(score) and score > 0.20):
+            verdict = "Undervalued / favorable"
+        elif one_year_ret < -0.05 or (np.isfinite(score) and score < -0.10):
+            verdict = "Overvalued / high risk"
+
+    # Reasons
+    reason_bits.append(f"annualized drift ≈ {ann_drift:.2%}")
+    reason_bits.append(f"annualized volatility ≈ {ann_vol:.2%}")
+    if last_regime:
+        reason_bits.append(f"current regime: **{last_regime}**")
+    if ml_note is not None:
+        reason_bits.append(f"ML drift adj. (annualized) ≈ {ml_note:.2%}")
+    if shock_prob > 0 or shock_sev > 0:
+        reason_bits.append(f"shock p={shock_prob:.3f}, severity={shock_sev:.2f}")
+    if np.isfinite(score):
+        reason_bits.append(f"risk-adjusted score ≈ {score:.2f}")
+
+    # Compose explainer
+    lines = []
+    lines.append(f"**Summary for {ticker}**")
+    lines.append(
+        f"The last price is **${S0:,.2f}**. The simulation’s mean prices are "
+        f"**1d: ${exp_prices.get('1 day', float('nan')):,.2f}**, "
+        f"**5d: ${exp_prices.get('5 days', float('nan')):,.2f}**, "
+        f"**1m (~21d): ${exp_prices.get('1 month (~21d)', float('nan')):,.2f}**, "
+        f"**6m (~126d): ${exp_prices.get('6 months (~126d)', float('nan')):,.2f}**, "
+        f"**1y (~252d): ${exp_prices.get('1 year (~252d)', float('nan')):,.2f}**."
+    )
+    lines.append(
+        "Corresponding expected returns from today are "
+        f"**1m: {exp_rets.get('1 month (~21d)', float('nan')):+.2%}**, "
+        f"**6m: {exp_rets.get('6 months (~126d)', float('nan')):+.2%}**, "
+        f"**1y: {one_year_ret:+.2%}**."
+    )
+    lines.append(
+        f"We estimate **{ann_drift:.2%}** annual drift and **{ann_vol:.2%}** annualized volatility "
+        f"from recent history{' with regime switching' if regime_on else ''}"
+        f"{' and GARCH-like volatility' if garch_on else ''}."
+        f"{' A short-horizon ML drift adjustment is applied' if ml_daily_drift is not None else ''}."
+    )
+    lines.append(
+        "Final verdict: **" + verdict + "** — " +
+        ("upside expected to outweigh risk on a 1-year horizon" if verdict.startswith("Under") else
+         "downside or poor risk-adjusted return on a 1-year horizon" if verdict.startswith("Over") else
+         "signals are balanced; risk and return appear roughly in line")
+        + "."
+    )
+    lines.append("**Why:** " + "; ".join(reason_bits) + ".")
+
+    return "\n\n".join(lines)
+
+
 max_steps = max(HORIZONS.values())
 with st.spinner("🧪 Running Monte Carlo simulation…"):
     _, mean_path = simulate_paths(
@@ -369,8 +464,24 @@ with tab1:
             for name, d in HORIZONS.items(): ax.scatter([d], [mean_path[d]]); ax.text(d, mean_path[d], name, ha="center", va="bottom", fontsize=8)
             ax.set_xlabel("Days Ahead"); ax.set_ylabel("Price"); ax.set_title("Mean Monte Carlo Path"); ax.grid(True, alpha=0.3)
             st.pyplot(fig)
-    st.divider(); st.markdown(f"**Summary:** {summary_text}")
-    st.caption("This is not investment advice. Simulation is for educational use only.")
+    st.divider()
+summary_md = build_summary(
+    ticker=ticker,
+    S0=S0,
+    mean_path=mean_path,
+    horizons=HORIZONS,
+    base_mu=base_mu,
+    base_sig=base_sig,
+    regimes_series=regimes_series,
+    ml_daily_drift=ml_daily_drift,
+    regime_on=regime_on,
+    garch_on=garch_on,
+    shock_prob=float(shock_prob),
+    shock_sev=float(shock_sev),
+)
+st.markdown(summary_md)
+st.caption("This is not investment advice. Simulation is for educational use only.")
+
 
 def walk_forward_validation(close: pd.Series, feats: pd.DataFrame, regimes: pd.Series,
                             base_mu: float, base_sig: float, regime_params, use_regime, use_garch, gp,
